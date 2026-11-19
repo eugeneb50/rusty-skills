@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""rusty-audit: deterministic quality signals for a Rust repo (stdlib only).
+
+Script first: measure before judging. Counts are heuristics over production
+code (skips target/, tests/, benches/, examples/, build.rs, tests.rs and
+everything after the first `#[cfg(test)]` in a file). Use them as a trend and
+a ratchet, not as a verdict; clippy is the precise tool (see `clippy`).
+
+Usage:
+  rusty-audit signals [ROOT] [--json]       counts + per-1k-lines density
+  rusty-audit clippy FILE|-  [--json]       count clippy JSON diagnostics per lint
+  rusty-audit ledger [ROOT]                 every `// lean:` shortcut; flags no trigger
+  rusty-audit ratchet BASELINE [ROOT] [--update]
+                                            exit 1 if any signal rose; --update
+                                            writes lowered counts (never raises)
+  rusty-audit record [ROOT]                 append signals to ROOT/.rusty/metrics.jsonl
+"""
+import json
+import re
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+SKIP_DIRS = {"target", "tests", "benches", "examples", ".git", "vendor", "node_modules"}
+SKIP_FILES = {"build.rs", "tests.rs"}
+
+# name -> regex. Lower is better for all of these.
+SIGNALS = {
+    "unwrap": r"\.unwrap\(\)",
+    "expect": r"\.expect\(",
+    "panic_macros": r"\b(?:panic|todo|unimplemented|unreachable)!",
+    "ignored_result": r"\blet _ =",
+    "dropped_err": r"\.ok\(\);",
+    "clone": r"\.clone\(\)",
+    "unsafe": r"\bunsafe\s*(?:\{|fn\b|impl\b)",
+    "spawn": r"\b(?:tokio::spawn|task::spawn|thread::spawn)\(",
+    "unbounded_channel": r"\bunbounded_channel\b|\bunbounded\(",
+    "sleep": r"\bsleep\(",
+    "block_on": r"\bblock_on\(",
+    "allow_attr": r"#!?\[allow\(",
+    "as_narrowing": r"\bas (?:u8|u16|u32|i8|i16|i32|usize|isize|f32)\b",
+    "todo_comment": r"//.*\b(?:TODO|FIXME|XXX|HACK)\b",
+}
+INFO = {"safety_comment": r"//\s*SAFETY:", "lean_marker": r"//\s*lean:"}
+LEAN_RE = re.compile(r"//\s*lean:\s*(.*)")
+TRIGGER_RE = re.compile(r"\b(?:upgrade|when|if|until|once)\b", re.I)
+
+
+def rust_files(root: Path):
+    for p in sorted(root.rglob("*.rs")):
+        rel = p.relative_to(root).parts
+        if any(part in SKIP_DIRS or part.startswith(".") for part in rel[:-1]):
+            continue
+        if p.name in SKIP_FILES:
+            continue
+        yield p
+
+
+def prod_lines(path: Path):
+    for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+        if line.strip().startswith("#[cfg(test)]"):
+            return
+        yield n, line
+
+
+def signals(root: Path) -> dict:
+    pats = {k: re.compile(v) for k, v in {**SIGNALS, **INFO}.items()}
+    c = Counter({k: 0 for k in pats})
+    files = loc = 0
+    for p in rust_files(root):
+        files += 1
+        for _, line in prod_lines(p):
+            if line.strip():
+                loc += 1
+            for k, rx in pats.items():
+                c[k] += len(rx.findall(line))
+    return {"files": files, "loc": loc, **c}
+
+
+def ledger(root: Path) -> list:
+    rows = []
+    for p in rust_files(root):
+        for n, line in prod_lines(p):
+            m = LEAN_RE.search(line)
+            if m:
+                text = m.group(1).strip()
+                rows.append({"file": str(p.relative_to(root)), "line": n, "text": text,
+                             "no_trigger": not TRIGGER_RE.search(text)})
+    return rows
+
+
+def clippy_counts(lines) -> dict:
+    seen, c = set(), Counter()
+    for raw in lines:
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            continue
+        msg = m.get("message") or {}
+        code = (msg.get("code") or {}).get("code")
+        if m.get("reason") != "compiler-message" or not code:
+            continue
+        span = next((s for s in msg.get("spans", []) if s.get("is_primary")), {})
+        key = (code, span.get("file_name"), span.get("line_start"))
+        if key not in seen:
+            seen.add(key)
+            c[code] += 1
+    return dict(c.most_common())
+
+
+def git_sha(root: Path) -> str:
+    r = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or None
+
+
+def print_signals(s: dict) -> None:
+    kloc = max(s["loc"], 1) / 1000
+    print(f"{s['files']} files, {s['loc']} prod lines")
+    for k in [*SIGNALS, *INFO]:
+        print(f"  {k:<18} {s[k]:>6}  {s[k] / kloc:7.2f}/kloc")
+
+
+def ratchet(base: Path, root: Path, update: bool) -> int:
+    now = signals(root)
+    old = json.loads(base.read_text()) if base.exists() else None
+    if old is None:
+        if update:
+            base.write_text(json.dumps({k: now[k] for k in SIGNALS}, indent=1) + "\n")
+            print(f"baseline written: {base}")
+            return 0
+        print(f"no baseline at {base}; run with --update")
+        return 2
+    rose = {k: (old.get(k, 0), now[k]) for k in SIGNALS if now[k] > old.get(k, 0)}
+    for k, (a, b) in rose.items():
+        print(f"ROSE {k}: {a} -> {b}")
+    if update:
+        lowered = {k: min(old.get(k, now[k]), now[k]) for k in SIGNALS}
+        if lowered != old:
+            base.write_text(json.dumps(lowered, indent=1) + "\n")
+            print("baseline lowered")
+    if not rose:
+        print("ratchet ok")
+    return 1 if rose else 0
+
+
+def main(argv) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], [a for a in argv[1:] if not a.startswith("--")]
+    flags = {a for a in argv[1:] if a.startswith("--")}
+    if cmd == "signals":
+        s = signals(Path(rest[0] if rest else "."))
+        print(json.dumps(s)) if "--json" in flags else print_signals(s)
+    elif cmd == "clippy":
+        src = sys.stdin if not rest or rest[0] == "-" else open(rest[0])
+        c = clippy_counts(src)
+        if "--json" in flags:
+            print(json.dumps(c))
+        else:
+            for k, v in c.items():
+                print(f"{v:6} {k}")
+    elif cmd == "ledger":
+        rows = ledger(Path(rest[0] if rest else "."))
+        for r in rows:
+            tag = "  [no-trigger]" if r["no_trigger"] else ""
+            print(f"{r['file']}:{r['line']} — {r['text']}{tag}")
+        print(f"{len(rows)} markers, {sum(r['no_trigger'] for r in rows)} with no trigger.")
+    elif cmd == "ratchet":
+        return ratchet(Path(rest[0]), Path(rest[1] if len(rest) > 1 else "."), "--update" in flags)
+    elif cmd == "record":
+        root = Path(rest[0] if rest else ".")
+        out = root / ".rusty/metrics.jsonl"
+        out.parent.mkdir(exist_ok=True)
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "sha": git_sha(root), "signals": signals(root)}
+        with out.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(f"recorded {out}")
+    else:
+        print(f"unknown command {cmd}\n{__doc__}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
